@@ -5,6 +5,12 @@ Usage:
     export DOCUMENTINTELLIGENCE_API_KEY="<your-key>"
     python submit_invoice_to_foundry.py /path/to/invoice.pdf
 
+To store extracted data in Azure Cosmos DB, also set:
+    export COSMOS_ENDPOINT="https://<your-account>.documents.azure.com:443/"
+    export COSMOS_KEY="<your-cosmos-key>"
+    export COSMOS_DATABASE="<database-name>"
+    export COSMOS_CONTAINER="<container-name>"
+
 Optional (AAD auth instead of API key):
     unset DOCUMENTINTELLIGENCE_API_KEY
     az login
@@ -16,10 +22,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.cosmos import CosmosClient, exceptions
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential
 
@@ -73,6 +82,46 @@ def analyze_invoice(file_path: Path) -> dict[str, Any]:
     return extract_invoice_fields(result)
 
 
+def store_in_cosmos(invoice_data: dict[str, Any], source_file: Path) -> str:
+    """Persist extracted invoice data into Azure Cosmos DB and return created item id."""
+    endpoint = os.environ.get("COSMOS_ENDPOINT")
+    key = os.environ.get("COSMOS_KEY")
+    database = os.environ.get("COSMOS_DATABASE")
+    container = os.environ.get("COSMOS_CONTAINER")
+
+    missing = [
+        env_name
+        for env_name, env_value in {
+            "COSMOS_ENDPOINT": endpoint,
+            "COSMOS_KEY": key,
+            "COSMOS_DATABASE": database,
+            "COSMOS_CONTAINER": container,
+        }.items()
+        if not env_value
+    ]
+    if missing:
+        raise ValueError(f"Missing required Cosmos DB configuration: {', '.join(missing)}")
+
+    cosmos_client = CosmosClient(url=endpoint, credential=key)
+    container_client = cosmos_client.get_database_client(database).get_container_client(container)
+
+    first_doc = (invoice_data.get("documents") or [{}])[0]
+    item = {
+        "id": str(uuid4()),
+        "invoiceId": first_doc.get("invoiceId") or str(uuid4()),
+        "sourceFile": source_file.name,
+        "processedAtUtc": datetime.now(timezone.utc).isoformat(),
+        "extract": invoice_data,
+    }
+
+    try:
+        container_client.create_item(body=item)
+    except exceptions.CosmosHttpResponseError as exc:
+        raise RuntimeError(f"Failed to write invoice extraction to Cosmos DB: {exc}") from exc
+
+    return item["id"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Submit an invoice file to Azure Document Intelligence.")
     parser.add_argument("invoice_file", type=Path, help="Path to PDF/image invoice file")
@@ -85,7 +134,9 @@ def main() -> None:
         raise FileNotFoundError(f"Invoice file not found: {args.invoice_file}")
 
     invoice_data = analyze_invoice(args.invoice_file)
+    cosmos_item_id = store_in_cosmos(invoice_data, args.invoice_file)
     print(json.dumps(invoice_data, indent=2, default=str))
+    print(f"Saved extracted invoice data to Cosmos DB item id: {cosmos_item_id}")
 
 
 if __name__ == "__main__":
